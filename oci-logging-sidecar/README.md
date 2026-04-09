@@ -122,6 +122,7 @@ This is only expected to work in a runtime that injects OCI resource principal c
 | `LOG_FORWARDER_FLUSH_INTERVAL` | no | `5s` | Batch flush interval |
 | `LOG_FORWARDER_CHUNK_LIMIT_SIZE` | no | `1m` | Max batch payload before immediate send |
 | `LOG_FORWARDER_QUEUED_BATCH_LIMIT` | no | `64` | Max queued on-disk batches before reads pause |
+| `LOG_FORWARDER_DISK_USAGE_LOG_INTERVAL` | no | `5m` | How often the forwarder logs total size of `app.log` plus rotated siblings |
 | `OCI_MAX_BATCH_ENTRIES` | no | `1000` | Max log lines per `PutLogs` request |
 | `OCI_MAX_ENTRY_SIZE_BYTES` | no | `900000` | Oversize lines are truncated to this limit |
 | `LOG_FORWARDER_STATE_DIR` | no | `/var/lib/oci-log-forwarder/state` | Checkpoint directory |

@@ -59,6 +59,19 @@ def parse_size_bytes(value: str) -> int:
     return int(raw)
 
 
+def format_size_bytes(size_bytes: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    size = float(size_bytes)
+    unit = units[0]
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            break
+        size /= 1024.0
+    if unit == "B":
+        return f"{int(size)} {unit}"
+    return f"{size:.1f} {unit}"
+
+
 def configure_logging() -> None:
     level_name = os.environ.get("LOG_FORWARDER_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
@@ -439,6 +452,9 @@ class OciLogForwarder:
         self.max_batch_entries = int(os.environ.get("OCI_MAX_BATCH_ENTRIES", "1000"))
         self.max_entry_size_bytes = int(os.environ.get("OCI_MAX_ENTRY_SIZE_BYTES", "900000"))
         self.poll_interval_seconds = float(os.environ.get("LOG_POLL_INTERVAL_SECONDS", "1"))
+        self.disk_usage_log_interval_seconds = parse_duration_seconds(
+            os.environ.get("LOG_FORWARDER_DISK_USAGE_LOG_INTERVAL", "5m")
+        )
         self.retry_initial_seconds = float(os.environ.get("OCI_RETRY_INITIAL_SECONDS", "1"))
         self.retry_max_seconds = float(os.environ.get("OCI_RETRY_MAX_SECONDS", "30"))
 
@@ -452,6 +468,7 @@ class OciLogForwarder:
         self.file_tracker = FileTracker(log_file_path, state_path, read_from_head, recovered_offsets)
         self.stop_requested = False
         self.last_flush_at = 0.0
+        self.next_disk_usage_log_at = 0.0
 
     def request_stop(self, signum: int, _frame: object) -> None:
         LOGGER.info("received signal %s; draining disk spool before exit", signum)
@@ -465,8 +482,10 @@ class OciLogForwarder:
         LOGGER.info("source file: %s", self.file_tracker.path)
         LOGGER.info("OCI auth mode: resource_principal")
         LOGGER.info("OCI log object id: %s", self.log_id)
+        self.log_log_storage_usage_if_due(force=True)
 
         while not self.stop_requested:
+            self.log_log_storage_usage_if_due()
             self.flush_spool()
 
             if self.spool_queue.count() < self.max_queued_batches:
@@ -484,6 +503,34 @@ class OciLogForwarder:
 
         self.flush_spool(stop_when_empty=True)
         return 0
+
+    def log_log_storage_usage_if_due(self, force: bool = False) -> None:
+        if self.disk_usage_log_interval_seconds <= 0:
+            return
+
+        now = time.monotonic()
+        if not force and now < self.next_disk_usage_log_at:
+            return
+
+        total_bytes = 0
+        file_count = 0
+        for candidate in sorted(self.file_tracker.path.parent.glob(f"{self.file_tracker.path.name}*")):
+            try:
+                if not candidate.is_file():
+                    continue
+                total_bytes += candidate.stat().st_size
+                file_count += 1
+            except FileNotFoundError:
+                continue
+
+        LOGGER.info(
+            "log files consume %s (%s) across %s file(s) under %s",
+            total_bytes,
+            format_size_bytes(total_bytes),
+            file_count,
+            self.file_tracker.path.parent,
+        )
+        self.next_disk_usage_log_at = now + self.disk_usage_log_interval_seconds
 
     def normalize_line(self, line: str) -> str:
         data = line.encode("utf-8")

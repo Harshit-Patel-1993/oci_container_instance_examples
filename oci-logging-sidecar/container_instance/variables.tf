@@ -124,6 +124,12 @@ variable "forwarder_queued_chunks_limit_size" {
   default     = "64"
 }
 
+variable "forwarder_disk_usage_log_interval" {
+  description = "How often the forwarder logs total size of the source log files, including rotated siblings."
+  type        = string
+  default     = "5m"
+}
+
 variable "logrotate_frequency" {
   description = "Logrotate cadence keyword."
   type        = string
@@ -201,4 +207,3 @@ variable "freeform_tags" {
   type        = map(string)
   default     = {}
 }
-
