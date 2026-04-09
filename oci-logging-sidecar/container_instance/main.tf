@@ -163,6 +163,7 @@ resource "oci_container_instances_container_instance" "logging_test" {
       LOG_FORWARDER_FLUSH_INTERVAL     = var.forwarder_flush_interval
       LOG_FORWARDER_CHUNK_LIMIT_SIZE   = var.forwarder_chunk_limit_size
       LOG_FORWARDER_QUEUED_BATCH_LIMIT = var.forwarder_queued_chunks_limit_size
+      LOGROTATE_ENABLED                = tostring(var.logrotate_enabled)
       LOG_FORWARDER_DISK_USAGE_LOG_INTERVAL = var.forwarder_disk_usage_log_interval
       LOGROTATE_FREQUENCY              = var.logrotate_frequency
       LOGROTATE_SIZE                   = var.logrotate_size

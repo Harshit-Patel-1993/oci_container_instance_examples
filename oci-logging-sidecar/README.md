@@ -21,7 +21,7 @@ The runtime model is:
 The forwarder uses:
 
 - resource principal authentication only
-- rename/create log rotation
+- optional rename/create log rotation
 - inode-aware file tracking
 - on-disk spool and checkpoint state
 
@@ -123,15 +123,16 @@ This is only expected to work in a runtime that injects OCI resource principal c
 | `LOG_FORWARDER_CHUNK_LIMIT_SIZE` | no | `1m` | Max batch payload before immediate send |
 | `LOG_FORWARDER_QUEUED_BATCH_LIMIT` | no | `64` | Max queued on-disk batches before reads pause |
 | `LOG_FORWARDER_DISK_USAGE_LOG_INTERVAL` | no | `5m` | How often the forwarder logs total size of `app.log` plus rotated siblings |
+| `LOGROTATE_ENABLED` | no | `false` | Whether the entrypoint starts the internal logrotate loop |
 | `OCI_MAX_BATCH_ENTRIES` | no | `1000` | Max log lines per `PutLogs` request |
 | `OCI_MAX_ENTRY_SIZE_BYTES` | no | `900000` | Oversize lines are truncated to this limit |
 | `LOG_FORWARDER_STATE_DIR` | no | `/var/lib/oci-log-forwarder/state` | Checkpoint directory |
 | `LOG_FORWARDER_SPOOL_DIR` | no | `/var/lib/oci-log-forwarder/spool` | On-disk spool directory |
 | `LOG_QUEUE_DIR` | no | `${LOG_FORWARDER_SPOOL_DIR}` | Explicit spool path override |
-| `LOGROTATE_FREQUENCY` | no | `hourly` | Rotation cadence |
-| `LOGROTATE_SIZE` | no | `50M` | Rotate after this size |
-| `LOGROTATE_ROTATE_COUNT` | no | `24` | Number of rotated files to retain |
-| `LOGROTATE_INTERVAL_SECONDS` | no | `60` | How often logrotate runs |
+| `LOGROTATE_FREQUENCY` | no | `hourly` | Rotation cadence when `LOGROTATE_ENABLED=true` |
+| `LOGROTATE_SIZE` | no | `50M` | Rotate after this size when `LOGROTATE_ENABLED=true` |
+| `LOGROTATE_ROTATE_COUNT` | no | `24` | Number of rotated files to retain when `LOGROTATE_ENABLED=true` |
+| `LOGROTATE_INTERVAL_SECONDS` | no | `60` | How often logrotate runs when `LOGROTATE_ENABLED=true` |
 
 ## Current Contract
 

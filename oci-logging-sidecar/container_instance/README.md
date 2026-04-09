@@ -58,6 +58,7 @@ Optional but commonly adjusted:
 - `display_name`
 - `log_group_display_name`
 - `custom_log_display_name`
+- `logrotate_enabled`
 - forwarder flush, chunk, and rotation settings
 
 ## OCI Auth for Terraform

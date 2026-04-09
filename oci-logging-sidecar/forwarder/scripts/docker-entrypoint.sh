@@ -5,6 +5,13 @@ log() {
   printf '[entrypoint] %s\n' "$*"
 }
 
+is_true() {
+  case "${1,,}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 require_env() {
   local name="$1"
   if [[ -z "${!name:-}" ]]; then
@@ -49,6 +56,7 @@ main() {
   export LOG_FORWARDER_CHUNK_LIMIT_SIZE="${LOG_FORWARDER_CHUNK_LIMIT_SIZE:-1m}"
   export LOG_FORWARDER_QUEUED_BATCH_LIMIT="${LOG_FORWARDER_QUEUED_BATCH_LIMIT:-64}"
   export LOG_FORWARDER_DISK_USAGE_LOG_INTERVAL="${LOG_FORWARDER_DISK_USAGE_LOG_INTERVAL:-5m}"
+  export LOGROTATE_ENABLED="${LOGROTATE_ENABLED:-false}"
   export LOGROTATE_FREQUENCY="${LOGROTATE_FREQUENCY:-hourly}"
   export LOGROTATE_ROTATE_COUNT="${LOGROTATE_ROTATE_COUNT:-24}"
   export LOGROTATE_SIZE="${LOGROTATE_SIZE:-50M}"
@@ -66,34 +74,47 @@ main() {
   fi
 
   mkdir -p \
-    "$(dirname "${LOGROTATE_STATE_FILE}")" \
     "${LOG_FORWARDER_SPOOL_DIR}" \
     "${LOG_FORWARDER_STATE_DIR}"
-
-  render_template /etc/logrotate.d/log-file.conf.template /etc/logrotate.d/log-file.conf
+  if is_true "${LOGROTATE_ENABLED}"; then
+    mkdir -p "$(dirname "${LOGROTATE_STATE_FILE}")"
+    render_template /etc/logrotate.d/log-file.conf.template /etc/logrotate.d/log-file.conf
+  fi
 
   log "starting OCI log forwarder"
   log "source file: ${LOG_FILE_PATH}"
   log "OCI auth mode: resource_principal"
   log "OCI log object id: ${OCI_LOG_OBJECT_ID}"
+  log "logrotate enabled: ${LOGROTATE_ENABLED}"
 
-  start_logrotate_loop &
-  logrotate_pid="$!"
+  logrotate_pid=""
+  if is_true "${LOGROTATE_ENABLED}"; then
+    start_logrotate_loop &
+    logrotate_pid="$!"
+  fi
   python3 -u /opt/oci-log-forwarder/oci_log_forwarder.py &
   forwarder_pid="$!"
 
   cleanup() {
     kill "${forwarder_pid}" 2>/dev/null || true
-    kill "${logrotate_pid}" 2>/dev/null || true
+    if [[ -n "${logrotate_pid}" ]]; then
+      kill "${logrotate_pid}" 2>/dev/null || true
+    fi
     wait "${forwarder_pid}" 2>/dev/null || true
-    wait "${logrotate_pid}" 2>/dev/null || true
+    if [[ -n "${logrotate_pid}" ]]; then
+      wait "${logrotate_pid}" 2>/dev/null || true
+    fi
   }
   trap cleanup EXIT INT TERM
 
-  wait -n "${forwarder_pid}" "${logrotate_pid}"
-  exit_code="$?"
-  cleanup
-  exit "${exit_code}"
+  if [[ -n "${logrotate_pid}" ]]; then
+    wait -n "${forwarder_pid}" "${logrotate_pid}"
+    exit_code="$?"
+    cleanup
+    exit "${exit_code}"
+  fi
+
+  wait "${forwarder_pid}"
 }
 
 main "$@"

@@ -130,6 +130,12 @@ variable "forwarder_disk_usage_log_interval" {
   default     = "5m"
 }
 
+variable "logrotate_enabled" {
+  description = "Whether the forwarder runs its internal logrotate loop."
+  type        = bool
+  default     = false
+}
+
 variable "logrotate_frequency" {
   description = "Logrotate cadence keyword."
   type        = string

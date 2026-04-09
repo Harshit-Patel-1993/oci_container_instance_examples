@@ -127,8 +127,8 @@ At startup, the forwarder:
 
 1. validates its required environment
 2. waits for the generator-created log file
-3. prepares the logrotate config
-4. starts a background logrotate loop
+3. optionally prepares the logrotate config
+4. optionally starts a background logrotate loop
 5. starts the Python shipping process
 
 ### What the Python shipper does
