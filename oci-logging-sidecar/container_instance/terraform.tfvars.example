@@ -1,0 +1,15 @@
+tenancy_ocid       = "ocid1.tenancy.oc1..exampleuniqueID"
+compartment_id     = "ocid1.compartment.oc1..exampleuniqueID"
+region             = "us-ashburn-1"
+availability_domain = "mcbJ:US-ASHBURN-AD-1"
+
+display_name       = "oci-logging-test"
+generator_image_url = "uk-london-1.ocir.io/axwtwdagdjcl/perf_test/oci-log-generator:latest"
+forwarder_image_url = "uk-london-1.ocir.io/axwtwdagdjcl/perf_test/oci-log-forwarder:latest"
+
+# Set this to your trusted source ranges if you want to call the generator directly.
+generator_ingress_cidrs = ["0.0.0.0/0"]
+
+freeform_tags = {
+  project = "container-instance-oci-logging"
+}
