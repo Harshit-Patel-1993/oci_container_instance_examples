@@ -276,9 +276,46 @@ The main resources are:
 - IAM policy
 - container instance
 
+### Reading `container_instance/main.tf` from top to bottom
+
+The main Terraform file is organized in the same order that a reader would usually reason about the deployment:
+
+1. configure the OCI provider
+2. define a small local value used for naming
+3. build the network
+4. create the logging destination
+5. create the IAM identity the runtime will use
+6. wait for IAM and logging propagation
+7. launch the container instance
+
+That makes `main.tf` a useful "single source of truth" for the full deployment.
+
+#### Provider and local value
+
+The file starts with:
+
+- `provider "oci"` using `var.region`
+- `locals { name_prefix = replace(var.display_name, "_", "-") }`
+
+The provider block tells Terraform which OCI region to target.
+
+The `local.name_prefix` value is a convenience for resource naming. It converts underscores in the container instance display name into hyphens, which are safer for names that are reused across network and VNIC resources.
+
 ### VCN
 
 The VCN provides the network boundary for the deployment.
+
+In `main.tf`, that is:
+
+- `oci_core_vcn.logging_test`
+
+It uses:
+
+- `var.compartment_id` to decide where the VCN lives
+- `var.vcn_cidr_block` for the address space
+- `${local.name_prefix}-vcn` for a predictable display name
+
+Every network resource later in the file points back to this VCN.
 
 ### Internet gateway and route table
 
@@ -287,6 +324,19 @@ These provide outbound connectivity so the runtime can:
 - reach OCI APIs
 - pull container images
 
+In `main.tf`, these are:
+
+- `oci_core_internet_gateway.logging_test`
+- `oci_core_route_table.logging_test`
+
+The route table adds a `0.0.0.0/0` route to the internet gateway. That means traffic leaving the subnet can reach public OCI endpoints such as:
+
+- image repositories
+- Logging ingestion endpoints
+- other OCI control-plane APIs used at runtime
+
+Without this pairing, the container instance could exist but fail at startup or fail to ship logs.
+
 ### Security list
 
 The security list allows:
@@ -294,9 +344,34 @@ The security list allows:
 - all outbound traffic
 - optional inbound access to the generator HTTP port from configured CIDRs
 
+In `main.tf`, this is `oci_core_security_list.logging_test`.
+
+The file does two important things here:
+
+- it allows all egress traffic to `0.0.0.0/0`
+- it generates ingress rules dynamically from `var.generator_ingress_cidrs`
+
+That `dynamic "ingress_security_rules"` block is worth calling out. Terraform iterates over every CIDR in `var.generator_ingress_cidrs` and creates a TCP rule that opens only `var.generator_http_port`.
+
+This means inbound access to the generator is:
+
+- optional
+- restricted to the configured client CIDRs
+- restricted to one TCP port instead of being broadly open
+
 ### Subnet
 
 The subnet is where the container instance VNIC is attached.
+
+In `main.tf`, that is `oci_core_subnet.logging_test`.
+
+It ties the network together by referencing:
+
+- the VCN ID
+- the route table ID
+- the security list ID
+
+The file sets `prohibit_public_ip_on_vnic = false`, which allows the VNIC to receive a public IP when the container instance later asks for one.
 
 ### Log group and custom log
 
@@ -304,9 +379,28 @@ These are the OCI Logging destination resources.
 
 The forwarder sends log batches to the custom log.
 
+In `main.tf`, these are:
+
+- `oci_logging_log_group.forwarder`
+- `oci_logging_log.forwarder`
+
+The log group is just the parent container. The custom log is the actual destination whose OCID is injected into the forwarder container as `OCI_LOG_OBJECT_ID`.
+
+That wiring matters because the forwarder does not discover the destination dynamically. Terraform creates the log first, then passes the resulting log OCID directly into the runtime environment.
+
 ### Dynamic group
 
 The dynamic group identifies the container instance runtime as an IAM principal.
+
+In `main.tf`, that is `oci_identity_dynamic_group.forwarder_runtime`.
+
+The matching rule is:
+
+```text
+ALL {resource.type = 'computecontainerinstance', resource.compartment.id = '<compartment_ocid>'}
+```
+
+This means any container instance in the target compartment can match the group. The repository then relies on policy scope to limit what that principal can actually do.
 
 ### IAM policy
 
@@ -314,6 +408,20 @@ The IAM policy grants that principal the permissions it needs, including:
 
 - reading container repositories
 - sending log content to OCI Logging
+
+In `main.tf`, that is `oci_identity_policy.forwarder_runtime`.
+
+The statements allow the dynamic group to:
+
+- read repos in the tenancy
+- use `log-content` for the specific log group created by Terraform
+
+That combination supports the two runtime actions that matter most:
+
+1. OCI can pull the configured container images
+2. the forwarder can call the Logging ingestion API with resource principal auth
+
+The policy is intentionally attached at the tenancy level because dynamic groups and IAM policies are tenancy-scoped resources in OCI.
 
 ### Container instance
 
@@ -328,6 +436,107 @@ It also defines:
 - the shared volumes
 - the VNIC placement
 - the environment variables for both containers
+
+In `main.tf`, this is the largest block: `oci_container_instances_container_instance.logging_test`.
+
+This block is where the infrastructure definition becomes an application deployment.
+
+#### Shape and lifecycle settings
+
+At the top of the resource, Terraform sets:
+
+- availability domain
+- compartment
+- display name
+- restart policy
+- shape
+- desired state
+
+Then the nested `shape_config` block applies `var.shape_ocpus` and `var.shape_memory_in_gbs`.
+
+This means compute sizing is fully parameterized without changing the structure of the deployment.
+
+#### Generator container block
+
+The first `containers {}` block defines `oci-log-generator`.
+
+It passes three environment variables:
+
+- `LOG_FILE_PATH`
+- `HTTP_PORT`
+- `DEFAULT_LOG_LEVEL`
+
+It also mounts the `logs` volume at `/mnt/logs`.
+
+That expresses the generator contract very clearly: it listens on the configured port and writes to the shared log path on the shared volume.
+
+#### Forwarder container block
+
+The second `containers {}` block defines `oci-log-forwarder`.
+
+Several details in this block are central to the architecture:
+
+- `is_resource_principal_disabled = false` enables resource principal access inside the container
+- `OCI_LOG_OBJECT_ID = oci_logging_log.forwarder.id` gives the shipper the exact custom log destination
+- `OCI_AUTH_TYPE = "resource_principal"` forces the intended auth mode
+- the remaining environment variables tune batching, queue depth, and log rotation behavior
+
+This block also mounts:
+
+- the shared `logs` volume at `/mnt/logs`
+- the `forwarder-state` volume at `/var/lib/oci-log-forwarder`
+
+That pairing is what lets the forwarder both read the application log and persist its own checkpoint and spool state separately.
+
+#### VNIC block
+
+The nested `vnics {}` block attaches the container instance to `oci_core_subnet.logging_test.id`.
+
+It also controls:
+
+- the VNIC display name
+- the hostname label
+- whether a public IP is assigned through `var.assign_public_ip`
+
+This is the network bridge between the OCI network resources created earlier in the file and the actual running containers.
+
+#### Volume blocks
+
+The two `volumes {}` blocks define:
+
+- `logs` as `EMPTYDIR`
+- `forwarder-state` as `EMPTYDIR`
+
+These are ephemeral volumes that live with the container instance lifecycle.
+
+That is enough for this example because the design goal is:
+
+- shared access between the two containers
+- short-lived spool durability during container restarts within the same container instance
+
+It is not trying to provide durable storage across full container instance replacement.
+
+#### Explicit dependency on the wait
+
+The container instance has:
+
+```text
+depends_on = [time_sleep.before_container_instance]
+```
+
+This forces Terraform to create the runtime only after the artificial wait has completed. It is a practical safeguard against IAM and logging propagation delays.
+
+### Why `main.tf` is structured this way
+
+The file is not just a list of OCI resources. It deliberately moves from prerequisites to runtime:
+
+1. network path
+2. logging destination
+3. runtime identity and permissions
+4. propagation delay
+5. container launch
+
+That ordering matches the actual dependency chain of the system. If you are reading the repository for the first time, `container_instance/main.tf` is the best place to understand how the architecture becomes a running OCI deployment.
 
 ---
 

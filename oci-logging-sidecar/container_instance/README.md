@@ -9,7 +9,7 @@ It provisions:
 - IAM resources for resource principal access
 - the container instance running the generator and forwarder containers
 
-For the architecture overview, see [current-architecture.md](/home/harpapat/Repos/container-instance-oci-logging/blog/current-architecture.md).
+For the architecture overview, see [architecture-walkthrough.md](/home/harpapat/Repos/oci_container_instance_examples/oci-logging-sidecar/blog/architecture-walkthrough.md).
 
 ## What Gets Created
 

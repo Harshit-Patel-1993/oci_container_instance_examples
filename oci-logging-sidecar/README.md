@@ -6,7 +6,7 @@ This repository contains a two-container logging setup for **OCI Container Insta
 - `forwarder/`: a resource-principal-only log shipper that reads that file and sends lines to OCI Logging
 - `container_instance/`: Terraform that provisions the OCI infrastructure and the container instance runtime
 
-If you want the architecture walkthrough first, read [current-architecture.md](/home/harpapat/Repos/container-instance-oci-logging/blog/current-architecture.md).
+If you want the architecture walkthrough first, read [architecture-walkthrough.md](/home/harpapat/Repos/oci_container_instance_examples/oci-logging-sidecar/blog/architecture-walkthrough.md).
 
 ## Architecture
 
