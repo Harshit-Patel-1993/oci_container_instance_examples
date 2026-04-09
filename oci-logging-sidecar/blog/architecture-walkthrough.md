@@ -143,6 +143,63 @@ The Python shipper:
 6. retries `PutLogs` requests until OCI accepts them
 7. removes queued batch files only after a successful send
 
+### Forwarder algorithm at a glance
+
+The easiest way to read `oci_log_forwarder.py` is to split it into four cooperating parts:
+
+- OCI client setup
+- file tracking and rotation handling
+- on-disk spool management
+- the main loop that alternates between flushing and reading
+
+```mermaid
+flowchart TD
+    START[Process starts] --> CLIENT[Build OCI Logging client<br/>with resource principal signer]
+    CLIENT --> RECOVER[Recover queued spool files<br/>and previous read offsets]
+    RECOVER --> TRACKER[Initialize FileTracker<br/>for app.log and rotated files]
+    TRACKER --> LOOP[Enter main loop]
+
+    LOOP --> USAGE[Log total log-file space usage<br/>on startup and on interval]
+    USAGE --> FLUSH[Flush oldest queued batch<br/>to OCI Logging]
+    FLUSH --> CHECK{Queued batches<br/>below limit?}
+    CHECK -->|Yes| READ[Read next batch from tracked file]
+    CHECK -->|No| SLEEP[Sleep for poll interval]
+    READ --> FOUND{Any lines read?}
+    FOUND -->|Yes| NORMALIZE[Normalize and truncate<br/>oversized entries if needed]
+    NORMALIZE --> SPOOL[Write batch JSON to spool directory]
+    SPOOL --> OFFSET[Persist new file offset]
+    OFFSET --> LOOP
+    FOUND -->|No| SLEEP
+    SLEEP --> LOOP
+```
+
+This diagram matches the actual structure of the file: `SpoolQueue` handles on-disk batches, `FileTracker` handles inode-aware reading, and `OciLogForwarder.start()` orchestrates the loop.
+
+### Startup and state recovery
+
+Before the forwarder can ship any new lines, it reconstructs what it was doing before a restart.
+
+```mermaid
+flowchart TD
+    A[Read environment variables] --> B[Create OCI Logging client]
+    B --> C[Open spool directory]
+    C --> D[Recover highest end_offset per inode<br/>from queued batch JSON files]
+    D --> E[Load state file with tracked_files]
+    E --> F[Merge recovered spool offsets<br/>with saved tracker state]
+    F --> G[Ensure current app.log exists]
+    G --> H[Resolve current inode and file size]
+    H --> I[Rebuild tracked_files list]
+    I --> J[Put rotated files first<br/>current app.log last]
+    J --> K[Persist normalized tracker state]
+```
+
+The recovery logic matters because the forwarder does not trust just one source of truth:
+
+- the state file remembers tracked files and offsets
+- the spool directory remembers batches already read but not yet acknowledged by OCI
+
+By merging both, the forwarder avoids re-reading lines that are already safely queued on disk.
+
 ### Authentication model
 
 The forwarder supports **resource principal authentication only**.
@@ -220,6 +277,39 @@ The forwarder tracks files by inode, which allows it to:
 
 This is important because the generator and forwarder run concurrently.
 
+### Rotation-handling algorithm
+
+The important detail is that the forwarder does **not** assume the pathname is stable. It treats inode identity as the durable reference and pathname as something that can move.
+
+```mermaid
+sequenceDiagram
+    participant G as Generator
+    participant LR as logrotate
+    participant FT as FileTracker
+    participant FS as Filesystem
+
+    G->>FS: append lines to /mnt/logs/app.log (inode 101)
+    FT->>FS: track app.log inode 101 offset N
+    LR->>FS: rename app.log to app.log-20260409
+    LR->>FS: create new app.log (inode 202)
+    FT->>FS: stat current app.log
+    FT->>FT: detect pathname now points to inode 202
+    FT->>FS: search siblings by old inode 101
+    FS-->>FT: old inode found at rotated path
+    FT->>FT: keep inode 101 as rotated file
+    FT->>FT: add inode 202 as current app.log
+    FT->>FS: continue reading unread bytes from inode 101
+    FT->>FS: then switch to inode 202 at app.log
+```
+
+That is why the tracker stores:
+
+- `path`
+- `inode`
+- `offset`
+
+The path helps reopen a file, but the inode is what lets the algorithm realize that "the current filename changed, but the old file still exists and still has unread bytes."
+
 ---
 
 ## 8. Reliability Model
@@ -241,6 +331,59 @@ This gives the system better durability during:
 - transient OCI API failures
 - forwarder restarts
 - bursts of log volume
+
+### Spool and retry algorithm
+
+The reliability model comes from a strict ordering rule:
+
+1. read lines from the log file
+2. write them to a spool file
+3. advance the tracked offset
+4. send the spool file to OCI
+5. delete the spool file only after success
+
+```mermaid
+flowchart TD
+    R[Read batch from tracked file] --> N[Normalize each line]
+    N --> W[Write spool JSON file]
+    W --> M[Mark source offset as spooled]
+    M --> F[Attempt to flush oldest spool file]
+    F --> S{PutLogs succeeds?}
+    S -->|Yes| D[Delete spool file]
+    D --> NEXT[Continue with next batch]
+    S -->|No| B[Log exception and back off]
+    B --> RETRY[Keep spool file on disk]
+    RETRY --> F
+```
+
+Because delivery happens from the spool rather than directly from the live file handle, temporary OCI failures do not force the forwarder to reread the source file from scratch.
+
+### Main loop behavior
+
+Once running, `OciLogForwarder.start()` repeats a small control loop.
+
+```mermaid
+flowchart TD
+    L0[Loop start] --> U[Maybe log total size of app.log<br/>and rotated siblings]
+    U --> F0[flush_spool]
+    F0 --> Q{spool count < limit?}
+    Q -->|No| P[Sleep poll interval]
+    Q -->|Yes| R0[file_tracker.read_batch]
+    R0 --> H{Batch returned?}
+    H -->|No| P
+    H -->|Yes| W0[Write batch to spool]
+    W0 --> O0[Persist offset with mark_spooled]
+    O0 --> L0
+    P --> L0
+```
+
+This is intentionally simple:
+
+- always try delivery first
+- only read more from disk when the queue has room
+- sleep when there is nothing useful to do
+
+That keeps the implementation understandable while still handling rotation, retries, and restart recovery.
 
 ---
 
