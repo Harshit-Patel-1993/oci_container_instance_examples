@@ -21,21 +21,18 @@ require_env() {
 }
 
 render_template() {
-  local src="$1"
   local dst="$2"
-
-  python3 - "${src}" "${dst}" <<'PY'
-import os
-import re
-import sys
-from pathlib import Path
-
-src = Path(sys.argv[1])
-dst = Path(sys.argv[2])
-template = src.read_text(encoding="utf-8")
-rendered = re.sub(r"\$\{([A-Z0-9_]+)\}", lambda match: os.environ.get(match.group(1), ""), template)
-dst.write_text(rendered, encoding="utf-8")
-PY
+  cat > "${dst}" <<EOF
+${METRIC_FILE_PATH} {
+    ${LOGROTATE_FREQUENCY}
+    rotate ${LOGROTATE_ROTATE_COUNT}
+    size ${LOGROTATE_SIZE}
+    copytruncate
+    missingok
+    notifempty
+    compress
+}
+EOF
 }
 
 start_logrotate_loop() {
@@ -78,7 +75,7 @@ main() {
     "${METRICS_FORWARDER_STATE_DIR}"
   if is_true "${LOGROTATE_ENABLED}"; then
     mkdir -p "$(dirname "${LOGROTATE_STATE_FILE}")"
-    render_template /etc/logrotate.d/metric-file.conf.template /etc/logrotate.d/metric-file.conf
+    render_template /etc/logrotate.d/metric-file.conf
   fi
 
   log "starting OCI metrics forwarder"
@@ -93,7 +90,7 @@ main() {
     start_logrotate_loop &
     logrotate_pid="$!"
   fi
-  python3 -u /opt/oci-metrics-forwarder/oci_metrics_forwarder.py &
+  /opt/oci-metrics-forwarder/oci-metrics-forwarder &
   forwarder_pid="$!"
 
   cleanup() {

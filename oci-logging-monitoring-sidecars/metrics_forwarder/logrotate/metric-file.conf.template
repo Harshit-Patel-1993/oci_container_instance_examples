@@ -1,9 +1,0 @@
-${METRIC_FILE_PATH} {
-    ${LOGROTATE_FREQUENCY}
-    rotate ${LOGROTATE_ROTATE_COUNT}
-    size ${LOGROTATE_SIZE}
-    copytruncate
-    missingok
-    notifempty
-    compress
-}

@@ -2,6 +2,11 @@
 __pycache__/
 *.pyc
 
+# Go build and test artifacts
+*.test
+coverage.out
+.coverprofile
+
 # Terraform working files
 .terraform/
 *.tfstate

@@ -17,7 +17,7 @@ The runtime model is:
 2. if enabled, the log forwarder waits for that file
 3. if enabled, the log forwarder tails the file and rotated successors
 4. if enabled, the log forwarder spools pending batches to disk
-5. if enabled, the log forwarder sends batches to OCI Logging with the OCI Python SDK
+5. if enabled, the log forwarder sends batches to OCI Logging with the OCI Go SDK
 
 When enabled, the log forwarder uses:
 
@@ -65,11 +65,15 @@ Build the log forwarder:
 docker build -t oci-log-forwarder ./log_forwarder
 ```
 
+The image is built from a compiled Go binary plus a small Alpine runtime.
+
 Build the metrics forwarder:
 
 ```bash
 docker build -t oci-metrics-forwarder ./metrics_forwarder
 ```
+
+The image is built from a compiled Go binary plus a small Alpine runtime.
 
 Build and push all three images to OCIR:
 
