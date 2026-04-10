@@ -5,7 +5,8 @@ This document explains the **current** architecture of the repository.
 It focuses on what exists today:
 
 - the generator container
-- the forwarder container
+- the optional log forwarder container
+- the metrics forwarder container directory
 - the shared storage model
 - the OCI resources created by Terraform
 - how logs move from a local file into OCI Logging
@@ -22,7 +23,7 @@ This repository demonstrates a simple OCI logging pattern:
 2. another container reads that file
 3. the second container sends those log lines to OCI Logging
 
-The pattern is implemented for **OCI Container Instances** and uses **resource principal authentication** for OCI API access.
+When enabled, the log forwarder pattern is implemented for **OCI Container Instances** and uses **resource principal authentication** for OCI API access.
 
 ---
 
@@ -32,7 +33,8 @@ The main directories are:
 
 ```text
 generator/          HTTP log producer image
-forwarder/          OCI log forwarder image
+log_forwarder/      OCI log forwarder image
+metrics_forwarder/  OCI Monitoring metrics forwarder image
 container_instance/ Terraform for OCI infrastructure and runtime
 blog/               repository documentation
 ```
@@ -40,7 +42,8 @@ blog/               repository documentation
 Each directory has a clear role:
 
 - `generator/` produces log lines
-- `forwarder/` ships log lines
+- `log_forwarder/` ships log lines
+- `metrics_forwarder/` ships custom metrics to OCI Monitoring
 - `container_instance/` provisions the OCI environment that runs both containers
 
 ---
@@ -50,14 +53,14 @@ Each directory has a clear role:
 At a high level, the runtime flow looks like this:
 
 ```text
-Client --> generator container --> shared log file --> forwarder container --> OCI Logging
+Client --> generator container --> shared log file --> log forwarder container --> OCI Logging
 ```
 
 ```mermaid
 flowchart LR
     C[Client] --> G[Generator Container]
     G --> F1[/Shared Log File<br>/mnt/logs/app.log/]
-    F1 --> FW[Forwarder Container]
+    F1 --> FW[Log Forwarder Container]
     FW --> L[OCI Logging Custom Log]
 ```
 
@@ -65,9 +68,9 @@ More concretely:
 
 1. the generator receives an HTTP request
 2. it appends a formatted line to `/mnt/logs/app.log`
-3. the forwarder waits for that file to exist
-4. the forwarder tails the file and any rotated successors
-5. the forwarder sends batches to OCI Logging with the OCI Python SDK
+3. the log forwarder waits for that file to exist
+4. the log forwarder tails the file and any rotated successors
+5. the log forwarder sends batches to OCI Logging with the OCI Python SDK
 
 ---
 
@@ -78,8 +81,12 @@ The generator is a small HTTP service.
 Its responsibilities are:
 
 - create the shared log file
+- create the shared metric file
 - expose a health endpoint
 - accept log-writing requests
+- accept metric-writing requests
+- enable or disable random background log generation
+- enable or disable random background metric generation
 - append formatted lines to the shared file
 
 ### Endpoints
@@ -88,15 +95,20 @@ The generator exposes:
 
 - `GET /health`
 - `POST /log`
+- `POST /metric`
+- `POST /random/logs`
+- `POST /random/metrics`
 
 ### Log file ownership
 
-The generator is the component that creates the shared log file.
+The generator is the component that creates the shared log file and the shared metric file.
 
 That is an explicit contract in this repository:
 
 - the **generator creates the file**
-- the **forwarder waits for it**
+- the **log forwarder waits for it**
+
+The same pattern now applies to the shared metrics file used for metrics-forwarder testing.
 
 ### Example request
 
@@ -108,11 +120,21 @@ curl -X POST http://<host>:8080/log \
 
 That produces a log line in the shared file.
 
+### Example metric request
+
+```bash
+curl -X POST http://<host>:8080/metric \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"request_count","value":1,"dimensions":{"service":"generator"}}'
+```
+
+That produces a JSON-lines metric record in the shared metrics file.
+
 ---
 
-## 5. Forwarder Container
+## 5. Log Forwarder Container
 
-The forwarder is responsible for getting local log lines into OCI Logging.
+The log forwarder is an optional sidecar responsible for getting local log lines into OCI Logging.
 
 It is built on:
 
@@ -121,9 +143,9 @@ It is built on:
 - the OCI Python SDK
 - `logrotate`
 
-### What the forwarder does
+### What the log forwarder does
 
-At startup, the forwarder:
+When enabled, the log forwarder at startup:
 
 1. validates its required environment
 2. waits for the generator-created log file
@@ -143,7 +165,7 @@ The Python shipper:
 6. retries `PutLogs` requests until OCI accepts them
 7. removes queued batch files only after a successful send
 
-### Forwarder algorithm at a glance
+### Log Forwarder Algorithm At A Glance
 
 The easiest way to read `oci_log_forwarder.py` is to split it into four cooperating parts:
 
@@ -177,7 +199,7 @@ This diagram matches the actual structure of the file: `SpoolQueue` handles on-d
 
 ### Startup and state recovery
 
-Before the forwarder can ship any new lines, it reconstructs what it was doing before a restart.
+Before the log forwarder can ship any new lines, it reconstructs what it was doing before a restart.
 
 ```mermaid
 flowchart TD
@@ -193,16 +215,16 @@ flowchart TD
     J --> K[Persist normalized tracker state]
 ```
 
-The recovery logic matters because the forwarder does not trust just one source of truth:
+The recovery logic matters because the log forwarder does not trust just one source of truth:
 
 - the state file remembers tracked files and offsets
 - the spool directory remembers batches already read but not yet acknowledged by OCI
 
-By merging both, the forwarder avoids re-reading lines that are already safely queued on disk.
+By merging both, the log forwarder avoids re-reading lines that are already safely queued on disk.
 
 ### Authentication model
 
-The forwarder supports **resource principal authentication only**.
+The log forwarder supports **resource principal authentication only**.
 
 That means:
 
@@ -222,9 +244,9 @@ The two containers share storage inside the container instance.
 flowchart TB
     subgraph CI[OCI Container Instance]
         G[Generator]
-        FW[Forwarder]
+        FW[Log Forwarder]
         LOGS[(logs EMPTYDIR)]
-        STATE[(forwarder-state EMPTYDIR)]
+        STATE[(log-forwarder-status EMPTYDIR)]
     end
 
     G -->|write /mnt/logs/app.log| LOGS
@@ -242,14 +264,14 @@ The generator writes:
 /mnt/logs/app.log
 ```
 
-The forwarder reads that same file.
+The log forwarder reads that same file.
 
-### Forwarder state volume
+### Log Forwarder State Volume
 
-The forwarder also mounts a second `EMPTYDIR` volume at:
+The log forwarder also mounts a second `EMPTYDIR` volume at:
 
 ```text
-/var/lib/oci-log-forwarder
+/mnt/log-forwarder-status
 ```
 
 This volume stores:
@@ -257,7 +279,7 @@ This volume stores:
 - the file read checkpoint
 - the on-disk spool of unsent batches
 
-This lets the forwarder survive container restarts within the same container instance without losing everything it had already queued.
+This lets the log forwarder survive container restarts within the same container instance without losing everything it had already queued.
 
 ---
 
@@ -270,16 +292,16 @@ The active file is rotated by **rename and create**:
 1. the current file is renamed
 2. a new file is created at the original path
 
-The forwarder tracks files by inode, which allows it to:
+The log forwarder tracks files by inode, which allows it to:
 
 - continue draining the rotated file
 - switch to the new active file without abandoning unread data from the old inode
 
-This is important because the generator and forwarder run concurrently.
+This is important because the generator and log forwarder run concurrently.
 
 ### Rotation-handling algorithm
 
-The important detail is that the forwarder does **not** assume the pathname is stable. It treats inode identity as the durable reference and pathname as something that can move.
+The important detail is that the log forwarder does **not** assume the pathname is stable. It treats inode identity as the durable reference and pathname as something that can move.
 
 ```mermaid
 sequenceDiagram
@@ -314,7 +336,7 @@ The path helps reopen a file, but the inode is what lets the algorithm realize t
 
 ## 8. Reliability Model
 
-The forwarder uses an on-disk spool instead of relying only on memory.
+The log forwarder uses an on-disk spool instead of relying only on memory.
 
 That means:
 
@@ -322,14 +344,14 @@ That means:
 - queued batches are written to disk
 - only then are they considered pending for delivery
 
-If OCI Logging is temporarily unavailable, the forwarder retries.
+If OCI Logging is temporarily unavailable, the log forwarder retries.
 
-If the forwarder container restarts, the spool files remain available on the mounted forwarder-state volume.
+If the log forwarder container restarts, the spool files remain available on the mounted log-forwarder-status volume.
 
 This gives the system better durability during:
 
 - transient OCI API failures
-- forwarder restarts
+- log forwarder restarts
 - bursts of log volume
 
 ### Spool and retry algorithm
@@ -356,7 +378,7 @@ flowchart TD
     RETRY --> F
 ```
 
-Because delivery happens from the spool rather than directly from the live file handle, temporary OCI failures do not force the forwarder to reread the source file from scratch.
+Because delivery happens from the spool rather than directly from the live file handle, temporary OCI failures do not force the log forwarder to reread the source file from scratch.
 
 ### Main loop behavior
 
@@ -520,22 +542,22 @@ The file sets `prohibit_public_ip_on_vnic = false`, which allows the VNIC to rec
 
 These are the OCI Logging destination resources.
 
-The forwarder sends log batches to the custom log.
+The log forwarder sends log batches to the custom log.
 
 In `main.tf`, these are:
 
-- `oci_logging_log_group.forwarder`
-- `oci_logging_log.forwarder`
+- `oci_logging_log_group.log_forwarder`
+- `oci_logging_log.log_forwarder`
 
-The log group is just the parent container. The custom log is the actual destination whose OCID is injected into the forwarder container as `OCI_LOG_OBJECT_ID`.
+The log group is just the parent container. The custom log is the actual destination whose OCID is injected into the log forwarder container as `OCI_LOG_OBJECT_ID` when the log forwarder is enabled.
 
-That wiring matters because the forwarder does not discover the destination dynamically. Terraform creates the log first, then passes the resulting log OCID directly into the runtime environment.
+That wiring matters because the log forwarder does not discover the destination dynamically. Terraform creates the log first, then passes the resulting log OCID directly into the runtime environment.
 
 ### Dynamic group
 
 The dynamic group identifies the container instance runtime as an IAM principal.
 
-In `main.tf`, that is `oci_identity_dynamic_group.forwarder_runtime`.
+In `main.tf`, that is `oci_identity_dynamic_group.log_forwarder_runtime`.
 
 The matching rule is:
 
@@ -552,7 +574,7 @@ The IAM policy grants that principal the permissions it needs, including:
 - reading container repositories
 - sending log content to OCI Logging
 
-In `main.tf`, that is `oci_identity_policy.forwarder_runtime`.
+In `main.tf`, that is `oci_identity_policy.log_forwarder_runtime`.
 
 The statements allow the dynamic group to:
 
@@ -562,7 +584,7 @@ The statements allow the dynamic group to:
 That combination supports the two runtime actions that matter most:
 
 1. OCI can pull the configured container images
-2. the forwarder can call the Logging ingestion API with resource principal auth
+2. the log forwarder can call the Logging ingestion API with resource principal auth
 
 The policy is intentionally attached at the tenancy level because dynamic groups and IAM policies are tenancy-scoped resources in OCI.
 
@@ -571,7 +593,7 @@ The policy is intentionally attached at the tenancy level because dynamic groups
 The container instance is the runtime resource that launches:
 
 - the generator container
-- the forwarder container
+- the log forwarder container
 
 It also defines:
 
@@ -601,7 +623,7 @@ This means compute sizing is fully parameterized without changing the structure 
 
 #### Generator container block
 
-The first `containers {}` block defines `oci-log-generator`.
+The first `containers {}` block defines `oci-generator`.
 
 It passes three environment variables:
 
@@ -613,23 +635,23 @@ It also mounts the `logs` volume at `/mnt/logs`.
 
 That expresses the generator contract very clearly: it listens on the configured port and writes to the shared log path on the shared volume.
 
-#### Forwarder container block
+#### Log Forwarder Container Block
 
 The second `containers {}` block defines `oci-log-forwarder`.
 
 Several details in this block are central to the architecture:
 
 - `is_resource_principal_disabled = false` enables resource principal access inside the container
-- `OCI_LOG_OBJECT_ID = oci_logging_log.forwarder.id` gives the shipper the exact custom log destination
+- `OCI_LOG_OBJECT_ID = oci_logging_log.log_forwarder[0].id` gives the shipper the exact custom log destination when the log forwarder is enabled
 - `OCI_AUTH_TYPE = "resource_principal"` forces the intended auth mode
 - the remaining environment variables tune batching, queue depth, and log rotation behavior
 
 This block also mounts:
 
 - the shared `logs` volume at `/mnt/logs`
-- the `forwarder-state` volume at `/var/lib/oci-log-forwarder`
+- the `log-forwarder-status` volume at `/mnt/log-forwarder-status`
 
-That pairing is what lets the forwarder both read the application log and persist its own checkpoint and spool state separately.
+That pairing is what lets the log forwarder both read the application log and persist its own checkpoint and spool state separately.
 
 #### VNIC block
 
@@ -648,7 +670,7 @@ This is the network bridge between the OCI network resources created earlier in 
 The two `volumes {}` blocks define:
 
 - `logs` as `EMPTYDIR`
-- `forwarder-state` as `EMPTYDIR`
+- `log-forwarder-status` as `EMPTYDIR`
 
 These are ephemeral volumes that live with the container instance lifecycle.
 
@@ -735,7 +757,7 @@ sequenceDiagram
     participant OCI as OCI Runtime
     participant G as Generator
     participant FS as Shared Log File
-    participant FW as Forwarder
+    participant FW as Log Forwarder
     participant Q as Disk Spool
     participant LOG as OCI Logging
 
@@ -752,12 +774,12 @@ sequenceDiagram
 ```
 
 1. OCI starts the container instance
-2. OCI pulls the generator and forwarder images
+2. OCI pulls the generator and log forwarder images
 3. the generator starts and creates the shared log file
-4. the forwarder waits until that file exists
+4. the log forwarder waits until that file exists
 5. the generator receives `POST /log` requests and appends lines
-6. the forwarder reads those lines and spools them to disk
-7. the forwarder sends them to OCI Logging
+6. the log forwarder reads those lines and spools them to disk
+7. the log forwarder sends them to OCI Logging
 8. log rotation continues in the background as the file grows
 
 ---
@@ -767,7 +789,7 @@ sequenceDiagram
 After deployment, the most useful verification approach is to check the system from both ends:
 
 - confirm that the generator is producing log lines
-- confirm that the forwarder is shipping them
+- confirm that the log forwarder is shipping them
 - confirm that the custom log in OCI Logging is receiving them
 
 ### Step 1: Confirm the generator is alive
@@ -802,10 +824,10 @@ This gives you a unique marker to look for in OCI Logging.
 If you have access to the runtime or container logs, verify that:
 
 - the generator accepted the request
-- the forwarder started successfully
-- the forwarder did not report OCI auth or `PutLogs` errors
+- the log forwarder started successfully
+- the log forwarder did not report OCI auth or `PutLogs` errors
 
-Typical forwarder startup signals are:
+Typical log forwarder startup signals are:
 
 - it is waiting for or found the shared log file
 - it started the OCI log forwarder process
@@ -817,7 +839,7 @@ In the OCI Console, navigate to:
 
 1. **Logging**
 2. the log group created by Terraform
-3. the custom log used by the forwarder
+3. the custom log used by the log forwarder
 
 Open the log search or log explorer view for that custom log.
 
@@ -848,29 +870,29 @@ Then confirm that all or nearly all expected messages appear in OCI Logging.
 This is a better test than a single message because it exercises:
 
 - repeated file appends
-- forwarder batching
+- log forwarder batching
 - OCI Logging ingestion over several requests
 
 ### Step 7: Verify behavior during rotation
 
 To verify that the system still works during rotation:
 
-1. lower the rotation threshold in Terraform or forwarder env
+1. lower the rotation threshold in Terraform or log forwarder env
 2. generate a larger batch of log lines
 3. confirm logs continue appearing in OCI Logging across multiple rotations
 
-This checks the inode-aware rotation handling in the forwarder.
+This checks the inode-aware rotation handling in the log forwarder.
 
 ### Step 8: Verify recovery after interruption
 
 To verify the on-disk spool behavior:
 
 1. generate log traffic
-2. interrupt or restart the forwarder container
+2. interrupt or restart the log forwarder container
 3. allow it to start again
 4. confirm that queued messages eventually appear in OCI Logging
 
-This checks that pending batches survive restart on the forwarder-state volume.
+This checks that pending batches survive restart on the log-forwarder-status volume.
 
 ### What successful verification looks like
 
@@ -878,7 +900,7 @@ You can consider the pipeline healthy when all of the following are true:
 
 - the generator health endpoint responds
 - `POST /log` requests succeed
-- the forwarder shows no auth or ingestion errors
+- the log forwarder shows no auth or ingestion errors
 - your test messages appear in the OCI custom log
 - logs continue to arrive during repeated writes and rotation
 
@@ -887,12 +909,12 @@ You can consider the pipeline healthy when all of the following are true:
 If logs do not appear in OCI Logging, the most common causes are:
 
 - the generator was never reached
-- the forwarder could not obtain a resource principal signer
+- the log forwarder could not obtain a resource principal signer
 - IAM policy or dynamic group propagation is not complete yet
 - the wrong custom log OCID was injected
 - OCI Logging ingestion calls are failing
 
-In practice, checking both the forwarder container output and the custom log search results usually isolates the problem quickly.
+In practice, checking both the log forwarder container output and the custom log search results usually isolates the problem quickly.
 
 ---
 
@@ -906,7 +928,7 @@ The generator writes log lines to a file.
 
 ### Layer 2: log shipper
 
-The forwarder watches that file and sends its contents to OCI Logging.
+The log forwarder watches that file and sends its contents to OCI Logging.
 
 ### Layer 3: OCI infrastructure
 
@@ -921,9 +943,9 @@ That is the core model of the repository.
 If you want the short version, remember these points:
 
 1. the generator creates and writes the shared log file
-2. the forwarder waits for that file and ships its contents
-3. the forwarder uses resource principal authentication
+2. the log forwarder waits for that file and ships its contents
+3. the log forwarder uses resource principal authentication
 4. Terraform provisions both the OCI infrastructure and the container instance runtime
-5. the forwarder uses inode-aware rotation handling and an on-disk spool for reliability
+5. the log forwarder uses inode-aware rotation handling and an on-disk spool for reliability
 
 That is the current architecture of this repository.

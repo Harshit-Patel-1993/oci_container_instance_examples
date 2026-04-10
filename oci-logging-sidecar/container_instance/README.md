@@ -5,9 +5,9 @@ This directory contains the Terraform for the repository's OCI deployment.
 It provisions:
 
 - networking for the container instance
-- an OCI log group and custom log
-- IAM resources for resource principal access
-- the container instance running the generator and forwarder containers
+- an optional OCI log group and custom log for the log forwarder
+- IAM resources for resource principal access to OCI Logging and OCI Monitoring
+- the container instance running the generator container, with optional log forwarder and metrics forwarder sidecars
 
 For the architecture overview, see [architecture-walkthrough.md](/home/harpapat/Repos/oci_container_instance_examples/oci-logging-sidecar/blog/architecture-walkthrough.md).
 
@@ -33,7 +33,9 @@ The `time_sleep` resource adds the configured wait before the container instance
 
 - Terraform `>= 1.5.0`
 - OCI credentials available to the Terraform OCI provider
-- generator and forwarder images already pushed to a registry reachable by the container instance
+- the generator image already pushed to a registry reachable by the container instance
+- if enabled, the log forwarder image already pushed to a registry reachable by the container instance
+- optionally, a metrics forwarder image already pushed to a registry reachable by the container instance
 
 ## Configure Variables
 
@@ -50,16 +52,22 @@ Then set at least:
 - `region`
 - `availability_domain`
 - `generator_image_url`
-- `forwarder_image_url`
 
 Optional but commonly adjusted:
 
+- `enable_log_forwarder`
+- `log_forwarder_image_url`
+- `enable_metrics_forwarder`
+- `metrics_forwarder_image_url`
+- `metric_file_path`
+- `metrics_namespace`
 - `generator_ingress_cidrs`
 - `display_name`
 - `log_group_display_name`
 - `custom_log_display_name`
-- `logrotate_enabled`
-- forwarder flush, chunk, and rotation settings
+- `log_forwarder_logrotate_enabled`
+- log forwarder flush, chunk, and rotation settings
+- metrics forwarder flush, chunk, and rotation settings
 
 ## OCI Auth for Terraform
 
@@ -82,7 +90,7 @@ export TF_VAR_region='us-ashburn-1'
 ## Apply
 
 ```bash
-cd /home/harpapat/Repos/container-instance-oci-logging/container_instance
+cd /home/harpapat/Repos/oci_container_instance_examples/oci-logging-sidecar/container_instance
 terraform init
 terraform plan -out tfplan
 terraform apply tfplan
@@ -98,6 +106,8 @@ Useful outputs include:
 - `subnet_id`
 - `log_group_id`
 - `custom_log_id`
+- `log_forwarder_enabled`
+- `metrics_forwarder_enabled`
 
 Show them later with:
 
@@ -120,6 +130,9 @@ terraform destroy
 
 ## Notes
 
-- The forwarder container is resource-principal-only.
-- The forwarder mounts `/var/lib/oci-log-forwarder` for its spool and checkpoint data.
-- The custom log OCID is created by Terraform and injected into the forwarder container automatically.
+- The log forwarder container is resource-principal-only when enabled.
+- The optional metrics forwarder container is also resource-principal-only.
+- The log forwarder mounts a dedicated `EMPTYDIR` volume at `/mnt/log-forwarder-status` for its spool and checkpoint data.
+- The optional metrics forwarder mounts a dedicated `EMPTYDIR` volume at `/mnt/metrics-forwarder-status` for its spool and checkpoint data.
+- When enabled, the custom log OCID is created by Terraform and injected into the log forwarder container automatically.
+- OCI Monitoring does not require a pre-created metric resource, but the IAM policy must allow `use metrics` in the target compartment.

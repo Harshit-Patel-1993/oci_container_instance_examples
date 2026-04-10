@@ -4,8 +4,11 @@ region             = "us-ashburn-1"
 availability_domain = "mcbJ:US-ASHBURN-AD-1"
 
 display_name       = "oci-logging-test"
-generator_image_url = "uk-london-1.ocir.io/axwtwdagdjcl/perf_test/oci-log-generator:latest"
-forwarder_image_url = "uk-london-1.ocir.io/axwtwdagdjcl/perf_test/oci-log-forwarder:latest"
+generator_image_url = "uk-london-1.ocir.io/axwtwdagdjcl/oci-generator:latest"
+enable_log_forwarder = true
+log_forwarder_image_url = "uk-london-1.ocir.io/axwtwdagdjcl/oci-log-forwarder:latest"
+enable_metrics_forwarder = true
+metrics_forwarder_image_url = "uk-london-1.ocir.io/axwtwdagdjcl/oci-metrics-forwarder:latest"
 
 # Set this to your trusted source ranges if you want to call the generator directly.
 generator_ingress_cidrs = ["0.0.0.0/0"]

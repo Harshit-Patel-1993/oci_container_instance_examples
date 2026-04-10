@@ -3,7 +3,9 @@ provider "oci" {
 }
 
 locals {
-  name_prefix = replace(var.display_name, "_", "-")
+  log_forwarder_enabled     = var.enable_log_forwarder && trimspace(var.log_forwarder_image_url) != ""
+  name_prefix               = replace(var.display_name, "_", "-")
+  metrics_forwarder_enabled = var.enable_metrics_forwarder && trimspace(var.metrics_forwarder_image_url) != ""
 }
 
 resource "oci_core_vcn" "logging_test" {
@@ -72,23 +74,25 @@ resource "oci_core_subnet" "logging_test" {
   freeform_tags              = var.freeform_tags
 }
 
-resource "oci_logging_log_group" "forwarder" {
+resource "oci_logging_log_group" "log_forwarder" {
+  count          = local.log_forwarder_enabled ? 1 : 0
   compartment_id = var.compartment_id
   display_name   = var.log_group_display_name
   description    = var.log_group_description
   freeform_tags  = var.freeform_tags
 }
 
-resource "oci_logging_log" "forwarder" {
+resource "oci_logging_log" "log_forwarder" {
+  count              = local.log_forwarder_enabled ? 1 : 0
   display_name       = var.custom_log_display_name
-  log_group_id       = oci_logging_log_group.forwarder.id
+  log_group_id       = oci_logging_log_group.log_forwarder[0].id
   log_type           = "CUSTOM"
   is_enabled         = true
   retention_duration = var.custom_log_retention_duration
   freeform_tags      = var.freeform_tags
 }
 
-resource "oci_identity_dynamic_group" "forwarder_runtime" {
+resource "oci_identity_dynamic_group" "log_forwarder_runtime" {
   compartment_id = var.tenancy_ocid
   name           = var.dynamic_group_name
   description    = var.dynamic_group_description
@@ -96,16 +100,21 @@ resource "oci_identity_dynamic_group" "forwarder_runtime" {
   freeform_tags  = var.freeform_tags
 }
 
-resource "oci_identity_policy" "forwarder_runtime" {
+resource "oci_identity_policy" "log_forwarder_runtime" {
   compartment_id = var.tenancy_ocid
   name           = var.policy_name
   description    = var.policy_description
   freeform_tags  = var.freeform_tags
 
-  statements = [
-    "Allow dynamic-group ${oci_identity_dynamic_group.forwarder_runtime.name} to read repos in tenancy",
-    "Allow dynamic-group ${oci_identity_dynamic_group.forwarder_runtime.name} to use log-content in compartment id ${var.compartment_id} where target.loggroup.id = '${oci_logging_log_group.forwarder.id}'",
-  ]
+  statements = concat(
+    [
+      "Allow dynamic-group ${oci_identity_dynamic_group.log_forwarder_runtime.name} to read repos in tenancy",
+      "Allow dynamic-group ${oci_identity_dynamic_group.log_forwarder_runtime.name} to use metrics in compartment id ${var.compartment_id}",
+    ],
+    local.log_forwarder_enabled ? [
+      "Allow dynamic-group ${oci_identity_dynamic_group.log_forwarder_runtime.name} to use log-content in compartment id ${var.compartment_id} where target.loggroup.id = '${oci_logging_log_group.log_forwarder[0].id}'",
+    ] : []
+  )
 }
 
 resource "time_sleep" "before_container_instance" {
@@ -113,10 +122,10 @@ resource "time_sleep" "before_container_instance" {
 
   depends_on = [
     oci_core_subnet.logging_test,
-    oci_logging_log_group.forwarder,
-    oci_logging_log.forwarder,
-    oci_identity_dynamic_group.forwarder_runtime,
-    oci_identity_policy.forwarder_runtime,
+    oci_logging_log_group.log_forwarder,
+    oci_logging_log.log_forwarder,
+    oci_identity_dynamic_group.log_forwarder_runtime,
+    oci_identity_policy.log_forwarder_runtime,
   ]
 }
 
@@ -135,11 +144,12 @@ resource "oci_container_instances_container_instance" "logging_test" {
   }
 
   containers {
-    display_name = "oci-log-generator"
+    display_name = "oci-generator"
     image_url    = var.generator_image_url
 
     environment_variables = {
       LOG_FILE_PATH     = var.log_file_path
+      METRIC_FILE_PATH  = var.metric_file_path
       HTTP_PORT         = tostring(var.generator_http_port)
       DEFAULT_LOG_LEVEL = var.generator_default_log_level
     }
@@ -148,37 +158,87 @@ resource "oci_container_instances_container_instance" "logging_test" {
       mount_path  = "/mnt/logs"
       volume_name = "logs"
     }
+
+    volume_mounts {
+      mount_path  = "/mnt/metrics"
+      volume_name = "metrics"
+    }
   }
 
-  containers {
-    display_name                   = "oci-log-forwarder"
-    image_url                      = var.forwarder_image_url
-    is_resource_principal_disabled = false
+  dynamic "containers" {
+    for_each = local.log_forwarder_enabled ? [1] : []
+    content {
+      display_name                   = "oci-log-forwarder"
+      image_url                      = var.log_forwarder_image_url
+      is_resource_principal_disabled = false
 
-    environment_variables = {
-      LOG_FILE_PATH                    = var.log_file_path
-      OCI_LOG_OBJECT_ID                = oci_logging_log.forwarder.id
-      OCI_AUTH_TYPE                    = "resource_principal"
-      LOG_FORWARDER_LOG_LEVEL          = var.forwarder_log_level
-      LOG_FORWARDER_FLUSH_INTERVAL     = var.forwarder_flush_interval
-      LOG_FORWARDER_CHUNK_LIMIT_SIZE   = var.forwarder_chunk_limit_size
-      LOG_FORWARDER_QUEUED_BATCH_LIMIT = var.forwarder_queued_chunks_limit_size
-      LOGROTATE_ENABLED                = tostring(var.logrotate_enabled)
-      LOG_FORWARDER_DISK_USAGE_LOG_INTERVAL = var.forwarder_disk_usage_log_interval
-      LOGROTATE_FREQUENCY              = var.logrotate_frequency
-      LOGROTATE_SIZE                   = var.logrotate_size
-      LOGROTATE_ROTATE_COUNT           = var.logrotate_rotate_count
-      LOGROTATE_INTERVAL_SECONDS       = var.logrotate_interval_seconds
+      environment_variables = {
+        LOG_FILE_PATH                         = var.log_file_path
+        OCI_LOG_OBJECT_ID                     = oci_logging_log.log_forwarder[0].id
+        OCI_AUTH_TYPE                         = "resource_principal"
+        LOG_FORWARDER_LOG_LEVEL               = var.log_forwarder_log_level
+        LOG_FORWARDER_FLUSH_INTERVAL          = var.log_forwarder_flush_interval
+        LOG_FORWARDER_CHUNK_LIMIT_SIZE        = var.log_forwarder_chunk_limit_size
+        LOG_FORWARDER_QUEUED_BATCH_LIMIT      = var.log_forwarder_queued_chunks_limit_size
+        LOG_FORWARDER_STATE_DIR               = "/mnt/log-forwarder-status/state"
+        LOG_FORWARDER_SPOOL_DIR               = "/mnt/log-forwarder-status/spool"
+        LOGROTATE_ENABLED                     = tostring(var.log_forwarder_logrotate_enabled)
+        LOG_FORWARDER_DISK_USAGE_LOG_INTERVAL = var.log_forwarder_disk_usage_log_interval
+        LOGROTATE_FREQUENCY                   = var.log_forwarder_logrotate_frequency
+        LOGROTATE_SIZE                        = var.log_forwarder_logrotate_size
+        LOGROTATE_ROTATE_COUNT                = var.log_forwarder_logrotate_rotate_count
+        LOGROTATE_INTERVAL_SECONDS            = var.log_forwarder_logrotate_interval_seconds
+      }
+
+      volume_mounts {
+        mount_path  = "/mnt/logs"
+        volume_name = "logs"
+      }
+
+      volume_mounts {
+        mount_path  = "/mnt/log-forwarder-status"
+        volume_name = "log-forwarder-status"
+      }
     }
+  }
 
-    volume_mounts {
-      mount_path  = "/mnt/logs"
-      volume_name = "logs"
-    }
+  dynamic "containers" {
+    for_each = local.metrics_forwarder_enabled ? [1] : []
+    content {
+      display_name                   = "oci-metrics-forwarder"
+      image_url                      = var.metrics_forwarder_image_url
+      is_resource_principal_disabled = false
 
-    volume_mounts {
-      mount_path  = "/var/lib/oci-log-forwarder"
-      volume_name = "forwarder-state"
+      environment_variables = {
+        METRIC_FILE_PATH                          = var.metric_file_path
+        OCI_REGION                                = var.region
+        OCI_MONITORING_NAMESPACE                  = var.metrics_namespace
+        OCI_MONITORING_COMPARTMENT_ID             = var.compartment_id
+        OCI_MONITORING_RESOURCE_GROUP             = var.metrics_resource_group
+        OCI_AUTH_TYPE                             = "resource_principal"
+        METRICS_FORWARDER_LOG_LEVEL               = var.metrics_forwarder_log_level
+        METRICS_FORWARDER_FLUSH_INTERVAL          = var.metrics_forwarder_flush_interval
+        METRICS_FORWARDER_CHUNK_LIMIT_SIZE        = var.metrics_forwarder_chunk_limit_size
+        METRICS_FORWARDER_QUEUED_BATCH_LIMIT      = var.metrics_forwarder_queued_chunks_limit_size
+        METRICS_FORWARDER_STATE_DIR               = "/mnt/metrics-forwarder-status/state"
+        METRICS_FORWARDER_SPOOL_DIR               = "/mnt/metrics-forwarder-status/spool"
+        METRICS_FORWARDER_DISK_USAGE_LOG_INTERVAL = var.metrics_forwarder_disk_usage_log_interval
+        LOGROTATE_ENABLED                         = tostring(var.metrics_logrotate_enabled)
+        LOGROTATE_FREQUENCY                       = var.metrics_logrotate_frequency
+        LOGROTATE_SIZE                            = var.metrics_logrotate_size
+        LOGROTATE_ROTATE_COUNT                    = var.metrics_logrotate_rotate_count
+        LOGROTATE_INTERVAL_SECONDS                = var.metrics_logrotate_interval_seconds
+      }
+
+      volume_mounts {
+        mount_path  = "/mnt/metrics"
+        volume_name = "metrics"
+      }
+
+      volume_mounts {
+        mount_path  = "/mnt/metrics-forwarder-status"
+        volume_name = "metrics-forwarder-status"
+      }
     }
   }
 
@@ -196,7 +256,17 @@ resource "oci_container_instances_container_instance" "logging_test" {
   }
 
   volumes {
-    name        = "forwarder-state"
+    name        = "log-forwarder-status"
+    volume_type = "EMPTYDIR"
+  }
+
+  volumes {
+    name        = "metrics"
+    volume_type = "EMPTYDIR"
+  }
+
+  volumes {
+    name        = "metrics-forwarder-status"
     volume_type = "EMPTYDIR"
   }
 

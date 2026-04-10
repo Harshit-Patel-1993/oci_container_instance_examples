@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import signal
-import socket
 import sys
 import time
 import uuid
@@ -16,7 +15,7 @@ from pathlib import Path
 import oci
 
 
-LOGGER = logging.getLogger("oci_log_forwarder")
+LOGGER = logging.getLogger("oci_metrics_forwarder")
 
 
 def getenv_required(name: str) -> str:
@@ -73,11 +72,11 @@ def format_size_bytes(size_bytes: int) -> str:
 
 
 def configure_logging() -> None:
-    level_name = os.environ.get("LOG_FORWARDER_LOG_LEVEL", "INFO").upper()
+    level_name = os.environ.get("METRICS_FORWARDER_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     logging.basicConfig(
         level=level,
-        format="[forwarder] %(asctime)s %(levelname)s %(message)s",
+        format="[metrics-forwarder] %(asctime)s %(levelname)s %(message)s",
         stream=sys.stdout,
     )
 
@@ -102,15 +101,58 @@ def resolve_region(explicit_region: str | None, signer: object | None) -> str | 
     return None
 
 
-def build_logging_client() -> oci.loggingingestion.LoggingClient:
+def resolve_monitoring_ingestion_endpoint(
+    client: oci.monitoring.MonitoringClient,
+    region: str | None,
+) -> str:
+    explicit_endpoint = os.environ.get("OCI_MONITORING_INGESTION_ENDPOINT", "").strip()
+    if explicit_endpoint:
+        return explicit_endpoint
+
+    current_endpoint = str(getattr(client.base_client, "endpoint", "") or "").strip()
+    if current_endpoint:
+        if "://telemetry-ingestion." in current_endpoint:
+            return current_endpoint
+        if "://monitoring." in current_endpoint:
+            return current_endpoint.replace("://monitoring.", "://telemetry-ingestion.", 1)
+
+    if region:
+        return f"https://telemetry-ingestion.{region}.oraclecloud.com"
+
+    raise ValueError(
+        "unable to determine OCI Monitoring telemetry ingestion endpoint; "
+        "set OCI_REGION or OCI_MONITORING_INGESTION_ENDPOINT"
+    )
+
+
+def build_monitoring_client() -> oci.monitoring.MonitoringClient:
     explicit_region = os.environ.get("OCI_REGION", "").strip() or None
     signer = oci.auth.signers.get_resource_principals_signer()
     region = resolve_region(explicit_region, signer)
     config = {"region": region} if region else {}
-    client = oci.loggingingestion.LoggingClient(config=config, signer=signer)
+    client = oci.monitoring.MonitoringClient(config=config, signer=signer)
     if region:
         client.base_client.set_region(region)
+    client.base_client.endpoint = resolve_monitoring_ingestion_endpoint(client, region)
+    LOGGER.info("using OCI Monitoring telemetry ingestion endpoint %s", client.base_client.endpoint)
     return client
+
+
+def parse_metric_timestamp(value: object | None) -> datetime:
+    if value is None:
+        return datetime.now(timezone.utc)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return datetime.now(timezone.utc)
+        normalized = normalized.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    raise ValueError(f"unsupported timestamp value: {value!r}")
 
 
 @dataclass
@@ -121,11 +163,31 @@ class TrackedFile:
 
 
 @dataclass
-class ReadBatch:
+class FileReadBatch:
     source_path: str
     inode: int
     end_offset: int
     lines: list[str]
+
+
+@dataclass
+class MetricRecord:
+    name: str
+    value: float
+    timestamp: str
+    dimensions: dict[str, str]
+    resource_group: str | None
+    metadata: dict[str, str]
+    namespace: str
+    compartment_id: str
+
+
+@dataclass
+class MetricBatch:
+    source_path: str
+    inode: int
+    end_offset: int
+    records: list[MetricRecord]
 
 
 class SpoolQueue:
@@ -156,12 +218,12 @@ class SpoolQueue:
     def list_batches(self) -> list[Path]:
         return sorted(self.spool_dir.glob("*.json"))
 
-    def write_batch(self, batch: ReadBatch) -> None:
+    def write_batch(self, batch: MetricBatch) -> None:
         payload = {
             "source_path": batch.source_path,
             "inode": batch.inode,
             "end_offset": batch.end_offset,
-            "lines": batch.lines,
+            "records": [asdict(record) for record in batch.records],
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         batch_name = f"{time.time_ns():020d}-{uuid.uuid4().hex}.json"
@@ -170,13 +232,13 @@ class SpoolQueue:
         tmp_path.write_text(json.dumps(payload), encoding="utf-8")
         os.replace(tmp_path, final_path)
 
-    def read_batch(self, path: Path) -> ReadBatch:
+    def read_batch(self, path: Path) -> MetricBatch:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        return ReadBatch(
+        return MetricBatch(
             source_path=str(payload["source_path"]),
             inode=int(payload["inode"]),
             end_offset=int(payload["end_offset"]),
-            lines=list(payload["lines"]),
+            records=[MetricRecord(**record) for record in payload["records"]],
         )
 
 
@@ -301,17 +363,14 @@ class FileTracker:
                 current_entry.path = str(found)
             else:
                 LOGGER.warning(
-                    "current file inode=%s moved but no rotated file was found; unread data may be lost",
+                    "current file inode=%s moved but no rotated file was found; unread metric data may be lost",
                     current_entry.inode,
                 )
                 self.tracked_files.remove(current_entry)
             current_entry = None
 
         if current_entry is None:
-            existing = next(
-                (tracked for tracked in self.tracked_files if tracked.inode == current_inode),
-                None,
-            )
+            existing = next((tracked for tracked in self.tracked_files if tracked.inode == current_inode), None)
             if existing is None:
                 self.tracked_files.append(TrackedFile(path=current_path, inode=current_inode, offset=0))
             else:
@@ -320,7 +379,7 @@ class FileTracker:
         else:
             if current_size < current_entry.offset:
                 LOGGER.warning(
-                    "current file %s shrank from %s bytes to %s bytes; rewinding tracked offset",
+                    "current metric file %s shrank from %s bytes to %s bytes; rewinding tracked offset",
                     current_path,
                     current_entry.offset,
                     current_size,
@@ -343,7 +402,7 @@ class FileTracker:
             found = self._find_path_by_inode(tracked.inode)
             if found is None:
                 LOGGER.warning(
-                    "tracked rotated file inode=%s disappeared before it was fully consumed",
+                    "tracked rotated metric file inode=%s disappeared before it was fully consumed",
                     tracked.inode,
                 )
                 self.tracked_files.remove(tracked)
@@ -358,7 +417,7 @@ class FileTracker:
             return True
         return False
 
-    def read_batch(self, max_lines: int, max_bytes: int) -> ReadBatch | None:
+    def read_batch(self, max_lines: int, max_bytes: int) -> FileReadBatch | None:
         self._refresh_current_file()
 
         for tracked in list(self.tracked_files):
@@ -392,7 +451,7 @@ class FileTracker:
                 found = self._find_path_by_inode(tracked.inode)
                 if found is None:
                     LOGGER.warning(
-                        "tracked file inode=%s disappeared before it could be consumed",
+                        "tracked metric file inode=%s disappeared before it could be consumed",
                         tracked.inode,
                     )
                     self.tracked_files.remove(tracked)
@@ -403,7 +462,7 @@ class FileTracker:
                 return self.read_batch(max_lines, max_bytes)
 
             if lines:
-                return ReadBatch(
+                return FileReadBatch(
                     source_path=tracked.path,
                     inode=tracked.inode,
                     end_offset=end_offset,
@@ -414,23 +473,19 @@ class FileTracker:
 
         return None
 
-    def mark_spooled(self, batch: ReadBatch) -> None:
+    def mark_consumed(self, source_path: str, inode: int, end_offset: int) -> None:
         tracked = next(
-            (
-                item
-                for item in self.tracked_files
-                if item.inode == batch.inode and item.path == batch.source_path
-            ),
+            (item for item in self.tracked_files if item.inode == inode and item.path == source_path),
             None,
         )
         if tracked is None:
-            tracked = next((item for item in self.tracked_files if item.inode == batch.inode), None)
+            tracked = next((item for item in self.tracked_files if item.inode == inode), None)
         if tracked is None:
-            tracked = TrackedFile(path=batch.source_path, inode=batch.inode, offset=batch.end_offset)
+            tracked = TrackedFile(path=source_path, inode=inode, offset=end_offset)
             self.tracked_files.append(tracked)
         else:
-            tracked.path = batch.source_path
-            tracked.offset = max(tracked.offset, batch.end_offset)
+            tracked.path = source_path
+            tracked.offset = max(tracked.offset, end_offset)
 
         current_path = str(self.path)
         rotated = [item for item in self.tracked_files if item.path != current_path]
@@ -439,64 +494,65 @@ class FileTracker:
         self._persist_state()
 
 
-class OciLogForwarder:
+class OciMetricsForwarder:
     def __init__(self) -> None:
-        self.client = build_logging_client()
-        self.log_id = getenv_required("OCI_LOG_OBJECT_ID")
-        self.log_source = os.environ.get("OCI_SOURCE", socket.gethostname())
-        self.log_subject = os.environ.get("OCI_SUBJECT", getenv_required("LOG_FILE_PATH"))
-        self.log_type = os.environ.get("OCI_LOG_TYPE", "app.log")
-        self.flush_interval_seconds = parse_duration_seconds(os.environ.get("LOG_FORWARDER_FLUSH_INTERVAL", "5s"))
-        self.chunk_limit_bytes = parse_size_bytes(os.environ.get("LOG_FORWARDER_CHUNK_LIMIT_SIZE", "1m"))
-        self.max_queued_batches = int(os.environ.get("LOG_FORWARDER_QUEUED_BATCH_LIMIT", "64"))
-        self.max_batch_entries = int(os.environ.get("OCI_MAX_BATCH_ENTRIES", "1000"))
-        self.max_entry_size_bytes = int(os.environ.get("OCI_MAX_ENTRY_SIZE_BYTES", "900000"))
-        self.poll_interval_seconds = float(os.environ.get("LOG_POLL_INTERVAL_SECONDS", "1"))
+        self.client = build_monitoring_client()
+        self.metric_namespace = getenv_required("OCI_MONITORING_NAMESPACE")
+        self.compartment_id = getenv_required("OCI_MONITORING_COMPARTMENT_ID")
+        self.resource_group = os.environ.get("OCI_MONITORING_RESOURCE_GROUP", "").strip() or None
+        self.flush_interval_seconds = parse_duration_seconds(os.environ.get("METRICS_FORWARDER_FLUSH_INTERVAL", "5s"))
+        self.chunk_limit_bytes = parse_size_bytes(os.environ.get("METRICS_FORWARDER_CHUNK_LIMIT_SIZE", "1m"))
+        self.max_queued_batches = int(os.environ.get("METRICS_FORWARDER_QUEUED_BATCH_LIMIT", "64"))
+        self.max_batch_entries = int(os.environ.get("OCI_MAX_BATCH_ENTRIES", "50"))
+        self.poll_interval_seconds = float(os.environ.get("METRIC_POLL_INTERVAL_SECONDS", "1"))
         self.disk_usage_log_interval_seconds = parse_duration_seconds(
-            os.environ.get("LOG_FORWARDER_DISK_USAGE_LOG_INTERVAL", "5m")
+            os.environ.get("METRICS_FORWARDER_DISK_USAGE_LOG_INTERVAL", "5m")
         )
         self.retry_initial_seconds = float(os.environ.get("OCI_RETRY_INITIAL_SECONDS", "1"))
         self.retry_max_seconds = float(os.environ.get("OCI_RETRY_MAX_SECONDS", "30"))
 
-        log_file_path = Path(getenv_required("LOG_FILE_PATH"))
-        state_dir = Path(os.environ.get("LOG_FORWARDER_STATE_DIR", "/var/lib/oci-log-forwarder/state"))
-        spool_dir = Path(os.environ.get("LOG_FORWARDER_SPOOL_DIR", "/var/lib/oci-log-forwarder/spool"))
-        state_path = Path(os.environ.get("LOG_STATE_FILE", str(state_dir / "input.json")))
-        self.spool_queue = SpoolQueue(Path(os.environ.get("LOG_QUEUE_DIR", str(spool_dir))))
+        metric_file_path = Path(getenv_required("METRIC_FILE_PATH"))
+        state_dir = Path(os.environ.get("METRICS_FORWARDER_STATE_DIR", "/var/lib/oci-metrics-forwarder/state"))
+        spool_dir = Path(os.environ.get("METRICS_FORWARDER_SPOOL_DIR", "/var/lib/oci-metrics-forwarder/spool"))
+        state_path = Path(os.environ.get("METRIC_STATE_FILE", str(state_dir / "input.json")))
+        self.spool_queue = SpoolQueue(Path(os.environ.get("METRIC_QUEUE_DIR", str(spool_dir))))
         read_from_head = parse_bool(os.environ.get("READ_FROM_HEAD", "true"))
         recovered_offsets = self.spool_queue.recover_offsets()
-        self.file_tracker = FileTracker(log_file_path, state_path, read_from_head, recovered_offsets)
+        self.file_tracker = FileTracker(metric_file_path, state_path, read_from_head, recovered_offsets)
         self.stop_requested = False
         self.last_flush_at = 0.0
         self.next_disk_usage_log_at = 0.0
 
     def request_stop(self, signum: int, _frame: object) -> None:
-        LOGGER.info("received signal %s; draining disk spool before exit", signum)
+        LOGGER.info("received signal %s; draining metric spool before exit", signum)
         self.stop_requested = True
 
     def start(self) -> int:
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
 
-        LOGGER.info("starting OCI log forwarder")
+        LOGGER.info("starting OCI metrics forwarder")
         LOGGER.info("source file: %s", self.file_tracker.path)
         LOGGER.info("OCI auth mode: resource_principal")
-        LOGGER.info("OCI log object id: %s", self.log_id)
-        self.log_log_storage_usage_if_due(force=True)
+        LOGGER.info("OCI Monitoring namespace: %s", self.metric_namespace)
+        LOGGER.info("OCI Monitoring compartment id: %s", self.compartment_id)
+        self.log_metric_file_usage_if_due(force=True)
 
         while not self.stop_requested:
-            self.log_log_storage_usage_if_due()
+            self.log_metric_file_usage_if_due()
             self.flush_spool()
 
             if self.spool_queue.count() < self.max_queued_batches:
-                batch = self.file_tracker.read_batch(
+                file_batch = self.file_tracker.read_batch(
                     max_lines=self.max_batch_entries,
                     max_bytes=self.chunk_limit_bytes,
                 )
-                if batch is not None:
-                    batch.lines = [self.normalize_line(line) for line in batch.lines]
-                    self.spool_queue.write_batch(batch)
-                    self.file_tracker.mark_spooled(batch)
+                if file_batch is not None:
+                    metric_batch = self.build_metric_batch(file_batch)
+                    self.file_tracker.mark_consumed(file_batch.source_path, file_batch.inode, file_batch.end_offset)
+                    if metric_batch is None:
+                        continue
+                    self.spool_queue.write_batch(metric_batch)
                     continue
 
             time.sleep(self.poll_interval_seconds)
@@ -504,7 +560,65 @@ class OciLogForwarder:
         self.flush_spool(stop_when_empty=True)
         return 0
 
-    def log_log_storage_usage_if_due(self, force: bool = False) -> None:
+    def build_metric_batch(self, file_batch: FileReadBatch) -> MetricBatch | None:
+        records: list[MetricRecord] = []
+        for line in file_batch.lines:
+            record = self.parse_metric_line(line)
+            if record is None:
+                continue
+            records.append(record)
+
+        if not records:
+            LOGGER.warning("skipping fully invalid metric batch from %s", file_batch.source_path)
+            return None
+
+        return MetricBatch(
+            source_path=file_batch.source_path,
+            inode=file_batch.inode,
+            end_offset=file_batch.end_offset,
+            records=records,
+        )
+
+    def parse_metric_line(self, line: str) -> MetricRecord | None:
+        try:
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                raise ValueError("metric line must be a JSON object")
+
+            name = str(payload["name"]).strip()
+            if not name:
+                raise ValueError("metric name must not be empty")
+
+            value = float(payload["value"])
+            timestamp = parse_metric_timestamp(payload.get("timestamp")).isoformat()
+            dimensions = {
+                str(key): str(value)
+                for key, value in dict(payload.get("dimensions", {})).items()
+            }
+            metadata = {
+                str(key): str(value)
+                for key, value in dict(payload.get("metadata", {})).items()
+            }
+            resource_group = payload.get("resource_group", self.resource_group)
+            if resource_group is not None:
+                resource_group = str(resource_group).strip() or None
+            namespace = str(payload.get("namespace", self.metric_namespace)).strip() or self.metric_namespace
+            compartment_id = str(payload.get("compartment_id", self.compartment_id)).strip() or self.compartment_id
+            return MetricRecord(
+                name=name,
+                value=value,
+                timestamp=timestamp,
+                dimensions=dimensions,
+                resource_group=resource_group,
+                metadata=metadata,
+                namespace=namespace,
+                compartment_id=compartment_id,
+            )
+        except Exception as exc:
+            LOGGER.warning("dropping invalid metric line %r: %s", line, exc)
+            return None
+
+    def log_metric_file_usage_if_due(self, force: bool = False) -> None:
         if self.disk_usage_log_interval_seconds <= 0:
             return
 
@@ -524,24 +638,13 @@ class OciLogForwarder:
                 continue
 
         LOGGER.info(
-            "log files consume %s (%s) across %s file(s) under %s",
+            "metric files consume %s (%s) across %s file(s) under %s",
             total_bytes,
             format_size_bytes(total_bytes),
             file_count,
             self.file_tracker.path.parent,
         )
         self.next_disk_usage_log_at = now + self.disk_usage_log_interval_seconds
-
-    def normalize_line(self, line: str) -> str:
-        data = line.encode("utf-8")
-        if len(data) <= self.max_entry_size_bytes:
-            return line
-
-        marker = " [truncated]"
-        allowed = max(0, self.max_entry_size_bytes - len(marker.encode("utf-8")))
-        truncated = data[:allowed].decode("utf-8", errors="ignore")
-        LOGGER.warning("truncating oversized log entry from %s bytes to %s bytes", len(data), self.max_entry_size_bytes)
-        return f"{truncated}{marker}"
 
     def flush_spool(self, stop_when_empty: bool = False) -> None:
         backoff = self.retry_initial_seconds
@@ -550,7 +653,7 @@ class OciLogForwarder:
             batch_paths = self.spool_queue.list_batches()
             if not batch_paths:
                 if stop_when_empty:
-                    LOGGER.info("drained all pending log batches")
+                    LOGGER.info("drained all pending metric batches")
                 return
 
             now = time.monotonic()
@@ -562,11 +665,8 @@ class OciLogForwarder:
             try:
                 self.put_batch(batch)
             except Exception as exc:
-                LOGGER.exception("failed to push %s log lines to OCI Logging: %s", len(batch.lines), exc)
-                if stop_when_empty and self.stop_requested:
-                    time.sleep(backoff)
-                else:
-                    time.sleep(backoff)
+                LOGGER.exception("failed to push %s metric(s) to OCI Monitoring: %s", len(batch.records), exc)
+                time.sleep(backoff)
                 backoff = min(backoff * 2, self.retry_max_seconds)
                 return
 
@@ -574,38 +674,37 @@ class OciLogForwarder:
             self.last_flush_at = time.monotonic()
             backoff = self.retry_initial_seconds
 
-    def put_batch(self, batch: ReadBatch) -> None:
-        timestamp = datetime.now(timezone.utc)
-        entries = [
-            oci.loggingingestion.models.LogEntry(
-                data=line,
-                id=str(uuid.uuid4()),
-                time=timestamp,
+    def put_batch(self, batch: MetricBatch) -> None:
+        metric_data = []
+        for record in batch.records:
+            datapoint = oci.monitoring.models.Datapoint(
+                timestamp=parse_metric_timestamp(record.timestamp),
+                value=record.value,
             )
-            for line in batch.lines
-        ]
-        log_entry_batch = oci.loggingingestion.models.LogEntryBatch(
-            entries=entries,
-            source=self.log_source,
-            type=self.log_type,
-            subject=self.log_subject,
-            defaultlogentrytime=timestamp,
-        )
-        put_logs_details = oci.loggingingestion.models.PutLogsDetails(
-            specversion="1.0",
-            log_entry_batches=[log_entry_batch],
-        )
-        self.client.put_logs(self.log_id, put_logs_details)
-        LOGGER.info("pushed %s log lines to OCI Logging", len(batch.lines))
+            metric_data.append(
+                oci.monitoring.models.MetricDataDetails(
+                    namespace=record.namespace,
+                    compartment_id=record.compartment_id,
+                    name=record.name,
+                    dimensions=record.dimensions,
+                    metadata=record.metadata,
+                    resource_group=record.resource_group,
+                    datapoints=[datapoint],
+                )
+            )
+
+        details = oci.monitoring.models.PostMetricDataDetails(metric_data=metric_data)
+        self.client.post_metric_data(details)
+        LOGGER.info("pushed %s metric(s) to OCI Monitoring", len(batch.records))
 
 
 def main() -> int:
     configure_logging()
     try:
-        forwarder = OciLogForwarder()
+        forwarder = OciMetricsForwarder()
         return forwarder.start()
     except Exception as exc:
-        LOGGER.exception("forwarder failed: %s", exc)
+        LOGGER.exception("metrics forwarder failed: %s", exc)
         return 1
 
 
